@@ -1,9 +1,12 @@
 """Compone un furni .swf de Habbo en una cuadrícula con todos sus estados (WebP animado)."""
 import io
 import math
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+
+from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
@@ -74,28 +77,36 @@ def _parse_visualization(blob, size):
 
 
 # --------------------------------------------------------------------------- composición
-def _compose_cell(items, assets, box, scale):
-    """items: [(asset, ink, alpha)] en orden de dibujo. Devuelve imagen RGB de la celda."""
+_scaled_cache = {}
+
+
+def _scaled(img, scale, key):
+    k = (key, scale)
+    if k not in _scaled_cache:
+        _scaled_cache[k] = img if scale == 1 else img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    return _scaled_cache[k]
+
+
+def _compose_cell(items, assets, box, scale, bg):
+    """items: [(asset, ink, alpha)] en orden de dibujo. bg ya viene a la escala final."""
     x0, y0, W, H = box
-    cell = Image.new("RGBA", (W, H), BG)
+    W, H = W * scale, H * scale
+    cell = bg.copy()
     for name, ink, alpha in items:
         img, x, y, flip = assets[name]
-        left = (x - img.width if flip else -x) - x0
-        top = -y - y0
-        im = img
+        im = _scaled(img, scale, name)
+        left = ((x - img.width if flip else -x) - x0) * scale
+        top = (-y - y0) * scale
         if alpha < 1:
-            im = img.copy()
+            im = im.copy()
             im.putalpha(im.getchannel("A").point(lambda v, a=alpha: int(v * a)))
         if ink == "ADD":
             layer = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-            layer.alpha_composite(im, (left, top)) if left >= 0 and top >= 0 else layer.paste(im, (left, top), im)
+            layer.paste(im, (left, top), im)
             cell = Image.merge("RGBA", (*ImageChops.add(cell.convert("RGB"), layer.convert("RGB")).split(), cell.getchannel("A")))
         else:
-            cell.alpha_composite(im, (left, top)) if left >= 0 and top >= 0 else cell.paste(im, (left, top), im)
-    cell = cell.convert("RGB")
-    if scale > 1:
-        cell = cell.resize((W * scale, H * scale), Image.NEAREST)
-    return cell
+            cell.paste(im, (left, top), im) if im.mode == "RGBA" else cell.paste(im, (left, top))
+    return cell.convert("RGB")
 
 
 def _font(px):
@@ -120,11 +131,78 @@ def _label(cell, text):
     d.text((4 + pad - l, 4 + pad - t), text, font=f, fill=(255, 255, 255, 255))
 
 
+# --------------------------------------------------------------------------- fondos
+def _gradient(W, H, top, bottom):
+    col = Image.new("RGB", (1, H))
+    col.putdata([tuple(int(top[k] + (bottom[k] - top[k]) * y / max(1, H - 1)) for k in range(3)) for y in range(H)])
+    return col.resize((W, H)).convert("RGBA")
+
+
+def _vignette(img, strength=0.55):
+    W, H = img.size
+    mask = Image.radial_gradient("L").resize((W, H), Image.BILINEAR)           # 0 centro -> 255 borde
+    mask = mask.point(lambda v: int(max(0, v - 70) * strength * 1.4))
+    return Image.composite(Image.new("RGBA", (W, H), (12, 13, 18, 255)), img, mask)
+
+
+DEFAULT_BG = Path(__file__).resolve().parent.parent / "assets" / "background.png"
+
+
+def _image_background(path, W, H):
+    """Recorta el centro de la imagen a resolución original (sin ampliarla salvo que sea más pequeña)."""
+    im = Image.open(path).convert("RGBA")
+    if im.width < W or im.height < H:
+        k = max(W / im.width, H / im.height)
+        im = im.resize((math.ceil(im.width * k), math.ceil(im.height * k)), Image.NEAREST)
+    l, t = (im.width - W) // 2, (im.height - H) // 2
+    return im.crop((l, t, l + W, t + H))
+
+
+def make_background(style, W, H, origin, image_path=None, scale=1):
+    """Fondo de una celda. W, H y origin en píxeles base; el resultado sale a W*scale x H*scale."""
+    style = (style or "").lower()
+    if not style:
+        style = "image" if DEFAULT_BG.exists() else "floor"
+    if style == "image":
+        path = image_path or DEFAULT_BG
+        try:
+            return _image_background(path, W * scale, H * scale)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! no se pudo cargar el fondo {path}: {e}", file=sys.stderr)
+            style = "floor"
+    img = _procedural_background(style, W, H, origin)
+    return img if scale == 1 else img.resize((W * scale, H * scale), Image.NEAREST)
+
+
+def _procedural_background(style, W, H, origin):
+    if style == "solid":
+        return Image.new("RGBA", (W, H), BG)
+    if style == "gradient":
+        return _vignette(_gradient(W, H, (34, 38, 52), (78, 86, 108)))
+    if style == "dark":
+        return _vignette(_gradient(W, H, (18, 19, 25), (40, 43, 54)), 0.4)
+    # "floor": suelo isométrico de baldosas 64x32 alineado con el punto 0,0 del furni
+    img = _gradient(W, H, (30, 33, 45), (62, 68, 88))
+    d = ImageDraw.Draw(img)
+    ox, oy = origin
+    c1, c2, edge = (104, 113, 140, 255), (90, 98, 124, 255), (66, 72, 96, 255)
+    n = (W + H) // 16 + 4
+    for i in range(-n, n):
+        for j in range(-n, n):
+            cx, cy = ox + (i - j) * 32, oy + (i + j) * 16
+            if cx < -40 or cx > W + 40 or cy < -20 or cy > H + 20:
+                continue
+            d.polygon([(cx, cy - 16), (cx + 32, cy), (cx, cy + 16), (cx - 32, cy)],
+                      fill=c1 if (i + j) % 2 == 0 else c2, outline=edge)
+    return _vignette(img, 0.5)
+
+
 def _lcm(a, b):
     return a * b // math.gcd(a, b)
 
 
-def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None, labels=True):
+def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None, labels=True,
+               background=None, bg_image=None):
     images, binaries, symbols = parse_swf(swf_bytes)
     by_name = {sym: images[cid] for cid, sym in symbols.items() if cid in images}
 
@@ -254,7 +332,11 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
         scale = math.ceil(min_cell / W)
     gap = 4
 
+    background = background or os.environ.get("BG_STYLE") or ""
+    bg_image = bg_image or os.environ.get("BG_IMAGE") or None
+
     def build(scale):
+        bg = make_background(background, W, H, (-box[0], -box[1]), bg_image, scale)
         gw, gh = cols * W * scale + (cols + 1) * gap, rows * H * scale + (rows + 1) * gap
         out = []
         cache = {}
@@ -263,9 +345,9 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
             for k, s in enumerate(state_ids):
                 key = (s, tuple(plan[s][t]))
                 if key not in cache:
-                    cell = _compose_cell(plan[s][t], assets, box, scale)
+                    cell = _compose_cell(plan[s][t], assets, box, scale, bg)
                     if labels and n > 1:
-                        _label(cell, f"Estado {s}")
+                        _label(cell, f"State {s}")
                     cache[key] = cell
                 r, c = divmod(k, cols)
                 sheet.paste(cache[key], (gap + c * (W * scale + gap), gap + r * (H * scale + gap)))
