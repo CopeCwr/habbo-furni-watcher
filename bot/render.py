@@ -201,7 +201,8 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
         for idx in order:
             seq = states[state].get(idx)
             frames = frames_of[idx]
-            fid = seq[t % len(seq)] if seq else (0 if 0 in frames else min(frames))
+            # Sin secuencia -> frame 0. Si el frame 0 no tiene imagen (hueco vacío), la capa está oculta.
+            fid = seq[t % len(seq)] if seq else 0
             if fid not in frames:
                 continue
             L = layers.get(idx, {})
