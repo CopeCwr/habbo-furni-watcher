@@ -58,6 +58,7 @@ def fetch_furnis(url):
             "id": el.get("id"),
             "classname": cls,
             "revision": _txt(el, "revision"),
+            "defaultdir": _txt(el, "defaultdir"),
             "name": _txt(el, "name") or cls,
             "description": _txt(el, "description") or "—",
             "canstandon": _flag(_txt(el, "canstandon")),
@@ -87,7 +88,8 @@ def get_render(furni):
             try:
                 r = requests.get(url, headers=HEADERS, timeout=60)
                 if r.status_code == 200 and r.content[:3] in (b"FWS", b"CWS", b"ZWS"):
-                    frames = render_swf(r.content, base)
+                    dd = furni.get("defaultdir")
+                    frames = render_swf(r.content, base, direction=int(dd) if dd and dd.isdigit() else None)
                     buf = io.BytesIO()
                     save_webp(frames, buf)
                     result = (buf.getvalue(), url)
