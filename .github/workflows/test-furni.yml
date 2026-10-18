@@ -1,0 +1,36 @@
+name: Probar furni manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      furni:
+        description: "ID del furni (ej. 9394) o classname (ej. exotic_r17_treefrog)"
+        required: true
+        default: "9394"
+      hotel:
+        description: "Hotel donde buscarlo (auto = prueba todos hasta encontrarlo)"
+        required: true
+        default: "auto"
+        type: choice
+        options: [auto, com, sandbox, es, fi, com.br, nl, de, com.tr, it, fr]
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Enviar furni a Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FURNI_QUERY: ${{ inputs.furni }}
+          FURNI_HOTEL: ${{ inputs.hotel }}
+        run: python -m bot.manual
