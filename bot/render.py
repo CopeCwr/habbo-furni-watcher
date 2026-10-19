@@ -12,8 +12,8 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
 from .swf import parse_swf
 
-TICK_MS = 125            # duración de cada paso de animación
-MAX_FRAMES = 120         # frames máximos del WebP
+TICK_MS = 42             # duración de cada paso (24 fps) - igual que el cliente de Habbo
+MAX_FRAMES = 1000        # pasos máximos de la animación (1000 x 42 ms = 42 s)
 BG = (58, 63, 75, 255)   # fondo de cada celda (necesario para el brillo aditivo)
 MAX_BYTES = 7_500_000    # límite de seguridad (Discord admite ~8-25 MB)
 
@@ -202,7 +202,7 @@ def _lcm(a, b):
 
 
 def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None, labels=True,
-               background=None, bg_image=None):
+               background=None, bg_image=None, max_ticks=None):
     images, binaries, symbols = parse_swf(swf_bytes)
     by_name = {sym: images[cid] for cid, sym in symbols.items() if cid in images}
 
@@ -215,7 +215,10 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
         # Algunos SWF solo guardan la imagen de una dirección y las demás la reutilizan
         m = name_re.match(asset)
         if m:
-            for d in (0, 2, 4, 6):
+            # La dirección opuesta (d+4) comparte dibujo; solo después se prueban las demás
+            cur = int(m.group(2))
+            opp = (cur + 4) % 8
+            for d in [opp] + [x for x in (0, 2, 4, 6) if x not in (opp, cur)]:
                 alt = f"{m.group(1)}_{d}_{m.group(3)}"
                 for key in (f"{classname}_{alt}", alt):
                     if key in by_name:
@@ -271,8 +274,9 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
     total = 1
     for p in periods.values():
         total = _lcm(total, p)
-    if total > MAX_FRAMES:
-        total = min(max(periods.values()), MAX_FRAMES)
+    cap = max_ticks or MAX_FRAMES
+    if total > cap:
+        total = min(max(periods.values()), cap)
 
     def items_at(state, t):
         out = []
@@ -323,7 +327,7 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
     W, H = box[2], box[3]
 
     n = len(state_ids)
-    cols = n if n <= 3 else 3 if n <= 6 else 4 if n <= 8 else 5
+    cols = n if n <= 3 else 2 if n == 4 else 3 if n <= 6 else 4 if n <= 8 else 5
     cols = max(1, cols)
     rows = math.ceil(n / cols)
     min_cell = 150 if labels and n > 1 else 0   # que quepa la etiqueta
@@ -338,10 +342,9 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
     def build(scale):
         bg = make_background(background, W, H, (-box[0], -box[1]), bg_image, scale)
         gw, gh = cols * W * scale + (cols + 1) * gap, rows * H * scale + (rows + 1) * gap
-        out = []
-        cache = {}
+        out, cache, sheets = [], {}, {}
         for t in range(total):
-            sheet = Image.new("RGB", (gw, gh), (30, 32, 38))
+            cells = []
             for k, s in enumerate(state_ids):
                 key = (s, tuple(plan[s][t]))
                 if key not in cache:
@@ -349,38 +352,65 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
                     if labels and n > 1:
                         _label(cell, f"State {s}")
                     cache[key] = cell
-                r, c = divmod(k, cols)
-                sheet.paste(cache[key], (gap + c * (W * scale + gap), gap + r * (H * scale + gap)))
-            out.append(sheet)
+                cells.append(cache[key])
+            sk = tuple(id(c) for c in cells)
+            if sk not in sheets:
+                sheet = Image.new("RGB", (gw, gh), (30, 32, 38))
+                for k, cell in enumerate(cells):
+                    r, c = divmod(k, cols)
+                    sheet.paste(cell, (gap + c * (W * scale + gap), gap + r * (H * scale + gap)))
+                sheets[sk] = sheet
+            out.append(sheets[sk])   # pasos idénticos comparten el mismo objeto
         return out
 
     return build(scale)
 
 
+def _encode(frames, **kw):
+    """Codifica a WebP fusionando pasos consecutivos idénticos (suma sus duraciones)."""
+    groups = []
+    for f in frames:
+        if groups and groups[-1][0] is f:
+            groups[-1][1] += 1
+        else:
+            groups.append([f, 1])
+    buf = io.BytesIO()
+    if len(groups) == 1:
+        groups[0][0].save(buf, "WEBP", **kw)
+    else:
+        imgs = [g[0] for g in groups]
+        imgs[0].save(buf, "WEBP", save_all=True, append_images=imgs[1:],
+                     duration=[g[1] * TICK_MS for g in groups], loop=0, **kw)
+    return buf.getvalue()
+
+
 def save_webp(frames, target):
     """Guarda como WebP (sin pérdida; si pesa demasiado, con pérdida mínima)."""
-    def write(buf, **kw):
-        if len(frames) == 1:
-            frames[0].save(buf, "WEBP", **kw)
-        else:
-            frames[0].save(buf, "WEBP", save_all=True, append_images=frames[1:],
-                           duration=TICK_MS, loop=0, **kw)
-    probe = io.BytesIO()
-    write(probe, lossless=True, minimize_size=True)
-    kw = dict(lossless=True, minimize_size=True)
-    if probe.tell() > MAX_BYTES:
-        kw = dict(quality=88, method=4)
+    data = _encode(frames, lossless=True, minimize_size=True)
+    if len(data) > MAX_BYTES:
+        data = _encode(frames, quality=88, method=4)
     if hasattr(target, "write"):
-        write(target, **kw)
+        target.write(data)
     else:
         with open(target, "wb") as f:
-            write(f, **kw)
+            f.write(data)
+
+
+def render_webp(swf_bytes, classname, direction=None):
+    """Renderiza el furni y devuelve el WebP (bytes). Si pesa demasiado, acorta el bucle."""
+    frames = None
+    for ticks in (MAX_FRAMES, 500, 250, 120):
+        frames = render_swf(swf_bytes, classname, direction=direction, max_ticks=ticks)
+        data = _encode(frames, lossless=True, minimize_size=True)
+        if len(data) <= MAX_BYTES:
+            return data
+    return _encode(frames, quality=88, method=4)
 
 
 if __name__ == "__main__":
     swf, out = sys.argv[1], sys.argv[2]
     cls = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].isdigit() else re.sub(r"\.swf$", "", swf.split("/")[-1])
     dr = int(sys.argv[-1]) if sys.argv[-1].isdigit() and len(sys.argv) > 3 else None
-    fr = render_swf(open(swf, "rb").read(), cls, direction=dr)
-    save_webp(fr, out)
-    print(f"{len(fr)} frames {fr[0].size} -> {out}")
+    data = render_webp(open(swf, "rb").read(), cls, direction=dr)
+    open(out, "wb").write(data)
+    print(f"{len(data)/1e6:.2f} MB -> {out}")
