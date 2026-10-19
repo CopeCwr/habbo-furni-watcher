@@ -9,7 +9,7 @@ from pathlib import Path
 
 import requests
 
-from .render import render_swf, save_webp
+from .render import render_webp
 
 HOTELS = {
     "com":     ("https://www.habbo.com/gamedata/furnidata_xml/1",     "🇺🇸"),
@@ -89,10 +89,8 @@ def get_render(furni):
                 r = requests.get(url, headers=HEADERS, timeout=60)
                 if r.status_code == 200 and r.content[:3] in (b"FWS", b"CWS", b"ZWS"):
                     dd = furni.get("defaultdir")
-                    frames = render_swf(r.content, base, direction=int(dd) if dd and dd.isdigit() else None)
-                    buf = io.BytesIO()
-                    save_webp(frames, buf)
-                    result = (buf.getvalue(), url)
+                    data = render_webp(r.content, base, direction=int(dd) if dd and dd.isdigit() else None)
+                    result = (data, url)
                     break
             except Exception as e:  # noqa: BLE001
                 print(f"  ! error con {url}: {e}", file=sys.stderr)
