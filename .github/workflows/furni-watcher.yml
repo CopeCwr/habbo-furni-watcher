@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write             # necesario para guardar state/known.json
 
+# Si una ejecución larga sigue en marcha, la siguiente espera (nunca se solapan)
 concurrency:
   group: furni-watcher
   cancel-in-progress: false
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120      # margen para hasta 200 avisos con imagen
     steps:
       - uses: actions/checkout@v4
 
@@ -27,11 +28,15 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Escanear furnidata y avisar por Discord
+        timeout-minutes: 100
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MAX_NOTIFY: 200        # máximo de avisos por ejecución
+          MAX_RUNTIME_MIN: 80    # a los 80 min deja de enviar y guarda lo que falte para la siguiente
         run: python -m bot.watcher
 
       - name: Guardar estado
+        if: always()             # se guarda aunque el paso anterior falle o se corte
         run: |
           git config user.name  "furni-watcher[bot]"
           git config user.email "furni-watcher@users.noreply.github.com"
