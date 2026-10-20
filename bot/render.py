@@ -14,6 +14,7 @@ from .swf import parse_swf
 
 TICK_MS = 42             # duración de cada paso (24 fps) - igual que el cliente de Habbo
 MAX_FRAMES = 1000        # pasos máximos de la animación (1000 x 42 ms = 42 s)
+SHADOW_ALPHA = 48 / 255   # opacidad de la sombra (negro) en el cliente de Habbo
 BG = (58, 63, 75, 255)   # fondo de cada celda (necesario para el brillo aditivo)
 MAX_BYTES = 7_500_000    # límite de seguridad (Discord admite ~8-25 MB)
 
@@ -63,14 +64,16 @@ def _parse_visualization(blob, size):
             seqs = {}
             for al in a.findall("animationLayer"):
                 idx = int(al.get("id"))
-                fs = al.find("frameSequence")
-                if fs is None:
+                fss = al.findall("frameSequence")
+                if not fss:
                     seqs[idx] = None
                     continue
                 rep = int(al.get("frameRepeat", "1"))
                 frames = []
-                for f in fs.findall("frame"):
-                    frames += [int(f.get("id"))] * rep
+                # Con random="1" el juego elige una secuencia al azar; aquí se encadenan todas
+                for fs in fss:
+                    for f in fs.findall("frame"):
+                        frames += [int(f.get("id"))] * rep
                 seqs[idx] = frames or None
             states[int(a.get("id"))] = seqs
     return layers, dir_z, states
@@ -202,7 +205,7 @@ def _lcm(a, b):
 
 
 def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None, labels=True,
-               background=None, bg_image=None, max_ticks=None):
+               background=None, bg_image=None, max_ticks=None, shadow=True):
     images, binaries, symbols = parse_swf(swf_bytes)
     by_name = {sym: images[cid] for cid, sym in symbols.items() if cid in images}
 
@@ -250,6 +253,9 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
     if direction not in by_dir:
         direction = 2 if 2 in by_dir else sorted(by_dir)[0]
     frames_of = by_dir[direction]            # idx -> {frame: asset}
+    shadow_asset = f"{classname}_{size}_sd_{direction}_0" if shadow else None
+    if shadow_asset not in assets:
+        shadow_asset = None
 
     layers, dir_z, states = _parse_visualization(_find_blob(binaries, symbols, "visualization"), size)
     if not states:
@@ -279,7 +285,7 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
         total = min(max(periods.values()), cap)
 
     def items_at(state, t):
-        out = []
+        out = [(shadow_asset, "COPY", SHADOW_ALPHA)] if shadow_asset else []
         for idx in order:
             seq = states[state].get(idx)
             frames = frames_of[idx]
@@ -295,19 +301,24 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
 
     # caja común para que todas las celdas cuadren (el halo tenue de los brillos no cuenta)
     sig_cache = {}
+    any_copy = any(ink != "ADD" for s_ in state_ids for items in plan[s_] for _, ink, _ in items)
 
     def sig_box(name, ink, alpha):
         key = (name, ink, alpha)
         if key not in sig_cache:
             img = assets[name][0]
             a = img.getchannel("A")
-            if ink == "ADD":
+            bb = None
+            if ink == "ADD" and any_copy:
+                # el halo tenue de un brillo no cuenta, salvo que todo el furni sea brillo
                 r, g, b, _ = img.split()
                 m = ImageChops.multiply(a, ImageChops.lighter(ImageChops.lighter(r, g), b))
-                mask = m.point(lambda v: 255 if v * alpha > 90 else 0)
-            else:
-                mask = a.point(lambda v: 255 if v * alpha > 16 else 0)
-            sig_cache[key] = mask.getbbox()
+                bb = m.point(lambda v: 255 if v * alpha > 90 else 0).getbbox()
+            elif ink != "ADD":
+                bb = a.point(lambda v: 255 if v * alpha > 16 else 0).getbbox()
+            if bb is None:  # respaldo: cualquier píxel visible
+                bb = a.point(lambda v: 255 if v > 8 else 0).getbbox()
+            sig_cache[key] = bb
         return sig_cache[key]
 
     x0 = y0 = 10 ** 9
@@ -322,6 +333,8 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
                 left = x - img.width if flip else -x
                 x0, y0 = min(x0, left + bb[0]), min(y0, -y + bb[1])
                 x1, y1 = max(x1, left + bb[2]), max(y1, -y + bb[3])
+    if x1 <= x0 or y1 <= y0:  # nada visible: caja por defecto para no fallar
+        x0, y0, x1, y1 = -32, -64, 32, 16
     pad = 6
     box = (x0 - pad, y0 - pad, x1 - x0 + pad * 2, y1 - y0 + pad * 2)
     W, H = box[2], box[3]
@@ -330,7 +343,7 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
     cols = n if n <= 3 else 2 if n == 4 else 3 if n <= 6 else 4 if n <= 8 else 5
     cols = max(1, cols)
     rows = math.ceil(n / cols)
-    min_cell = 150 if labels and n > 1 else 0   # que quepa la etiqueta
+    min_cell = 140 if labels and n > 1 else 0   # que quepa la etiqueta
     scale = max(1, min(3, 960 // (cols * W)))
     if W * scale < min_cell:
         scale = math.ceil(min_cell / W)
@@ -396,11 +409,11 @@ def save_webp(frames, target):
             f.write(data)
 
 
-def render_webp(swf_bytes, classname, direction=None):
+def render_webp(swf_bytes, classname, direction=None, shadow=True):
     """Renderiza el furni y devuelve el WebP (bytes). Si pesa demasiado, acorta el bucle."""
     frames = None
     for ticks in (MAX_FRAMES, 500, 250, 120):
-        frames = render_swf(swf_bytes, classname, direction=direction, max_ticks=ticks)
+        frames = render_swf(swf_bytes, classname, direction=direction, max_ticks=ticks, shadow=shadow)
         data = _encode(frames, lossless=True, minimize_size=True)
         if len(data) <= MAX_BYTES:
             return data
@@ -408,9 +421,11 @@ def render_webp(swf_bytes, classname, direction=None):
 
 
 if __name__ == "__main__":
-    swf, out = sys.argv[1], sys.argv[2]
-    cls = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].isdigit() else re.sub(r"\.swf$", "", swf.split("/")[-1])
-    dr = int(sys.argv[-1]) if sys.argv[-1].isdigit() and len(sys.argv) > 3 else None
-    data = render_webp(open(swf, "rb").read(), cls, direction=dr)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    wall = "--wall" in sys.argv          # furni de pared: sin sombra
+    swf, out = args[0], args[1]
+    cls = args[2] if len(args) > 2 and not args[2].isdigit() else re.sub(r"\.swf$", "", swf.split("/")[-1])
+    dr = int(args[-1]) if len(args) > 2 and args[-1].isdigit() else None
+    data = render_webp(open(swf, "rb").read(), cls, direction=dr, shadow=not wall)
     open(out, "wb").write(data)
     print(f"{len(data)/1e6:.2f} MB -> {out}")
