@@ -204,8 +204,69 @@ def _lcm(a, b):
     return a * b // math.gcd(a, b)
 
 
+# --------------------------------------------------------------------------- colores
+_HEX = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def _hex(value):
+    m = _HEX.match((value or "").strip())
+    if not m:
+        return None
+    h = m.group(1)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _parse_colors(blob, size):
+    """Sección <colors> de la visualización -> {id_color: {capa: (r, g, b)}}."""
+    out = {}
+    if blob is None:
+        return out
+    node = None
+    for v in _xml(blob).iter("visualization"):
+        if v.get("size") == str(size):
+            node = v
+    cols = node.find("colors") if node is not None else None
+    if cols is None:
+        return out
+    for c in cols.findall("color"):
+        d = {}
+        for cl in c.findall("colorLayer"):
+            rgb = _hex(cl.get("color"))
+            if rgb and cl.get("id") is not None:
+                d[int(cl.get("id"))] = rgb
+        out[int(c.get("id"))] = d
+    return out
+
+
+def _resolve_tints(vis_colors, color_id, partcolors, fallback_layers):
+    """Decide el tono de cada capa teñible.
+    - Los `partcolors` del furnidata mandan si encajan con las capas teñibles
+      (1 color para todas, o uno por capa, en orden).
+    - Si no, se usa el color `color_id` de la sección <colors> del propio SWF."""
+    swf = vis_colors.get(color_id) if color_id is not None else None
+    layers = sorted({l for d in vis_colors.values() for l in d}) or sorted(fallback_layers)
+    pcs = [c for c in (_hex(x) for x in (partcolors or [])) if c]
+    if pcs and layers:
+        if len(pcs) == 1:
+            return {l: pcs[0] for l in layers}
+        if len(pcs) == len(layers):
+            return dict(zip(layers, pcs))
+        if not swf:
+            return {l: (pcs[i] if i < len(pcs) else pcs[-1]) for i, l in enumerate(layers)}
+    return dict(swf) if swf else {}
+
+
+def _tint(img, rgb):
+    """Tiñe multiplicando cada canal por el color (como hace el cliente de Habbo)."""
+    r, g, b, a = img.split()
+    r, g, b = (ch.point(lambda v, k=k: v * k // 255) for ch, k in zip((r, g, b), rgb))
+    return Image.merge("RGBA", (r, g, b, a))
+
+
 def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None, labels=True,
-               background=None, bg_image=None, max_ticks=None, shadow=True):
+               background=None, bg_image=None, max_ticks=None, shadow=True,
+               color_id=None, partcolors=None):
+    _scaled_cache.clear()
     images, binaries, symbols = parse_swf(swf_bytes)
     by_name = {sym: images[cid] for cid, sym in symbols.items() if cid in images}
 
@@ -257,7 +318,16 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
     if shadow_asset not in assets:
         shadow_asset = None
 
-    layers, dir_z, states = _parse_visualization(_find_blob(binaries, symbols, "visualization"), size)
+    vis_blob = _find_blob(binaries, symbols, "visualization")
+    layers, dir_z, states = _parse_visualization(vis_blob, size)
+
+    # Furnis coloreables: teñir las capas correspondientes (classname*N -> color_id N)
+    tints = _resolve_tints(_parse_colors(vis_blob, size), color_id, partcolors, frames_of)
+    if tints:
+        for name, (img, x, y, flip) in list(assets.items()):
+            m = pat.match(name)
+            if m and len(m.group(1)) == 1 and (ord(m.group(1)) - 97) in tints:
+                assets[name] = (_tint(img, tints[ord(m.group(1)) - 97]), x, y, flip)
     if not states:
         states = {0: {i: None for i in frames_of}}
     state_ids = sorted(states)
@@ -409,11 +479,12 @@ def save_webp(frames, target):
             f.write(data)
 
 
-def render_webp(swf_bytes, classname, direction=None, shadow=True):
+def render_webp(swf_bytes, classname, direction=None, shadow=True, color_id=None, partcolors=None):
     """Renderiza el furni y devuelve el WebP (bytes). Si pesa demasiado, acorta el bucle."""
     frames = None
     for ticks in (MAX_FRAMES, 500, 250, 120):
-        frames = render_swf(swf_bytes, classname, direction=direction, max_ticks=ticks, shadow=shadow)
+        frames = render_swf(swf_bytes, classname, direction=direction, max_ticks=ticks, shadow=shadow,
+                            color_id=color_id, partcolors=partcolors)
         data = _encode(frames, lossless=True, minimize_size=True)
         if len(data) <= MAX_BYTES:
             return data
@@ -421,11 +492,25 @@ def render_webp(swf_bytes, classname, direction=None, shadow=True):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    wall = "--wall" in sys.argv          # furni de pared: sin sombra
+    # uso: python -m bot.render furni.swf salida.webp [clase] [direccion] [--wall] [--color N] [--partcolors "#hex,#hex"]
+    argv, opts, k = sys.argv[1:], {}, 0
+    args = []
+    while k < len(argv):
+        if argv[k] in ("--color", "--partcolors") and k + 1 < len(argv):
+            opts[argv[k]] = argv[k + 1]
+            k += 2
+        elif argv[k].startswith("--"):
+            opts[argv[k]] = True
+            k += 1
+        else:
+            args.append(argv[k])
+            k += 1
     swf, out = args[0], args[1]
     cls = args[2] if len(args) > 2 and not args[2].isdigit() else re.sub(r"\.swf$", "", swf.split("/")[-1])
     dr = int(args[-1]) if len(args) > 2 and args[-1].isdigit() else None
-    data = render_webp(open(swf, "rb").read(), cls, direction=dr, shadow=not wall)
+    cid = int(opts["--color"]) if "--color" in opts else None
+    pcs = opts["--partcolors"].split(",") if "--partcolors" in opts else None
+    data = render_webp(open(swf, "rb").read(), cls, direction=dr, shadow="--wall" not in opts,
+                       color_id=cid, partcolors=pcs)
     open(out, "wb").write(data)
     print(f"{len(data)/1e6:.2f} MB -> {out}")
