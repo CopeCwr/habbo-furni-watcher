@@ -95,59 +95,46 @@ def fetch_furnis(url):
 
 
 _render_cache = {}
+FOLLOWUPS = os.environ.get("FOLLOWUPS", "1").strip().lower() not in ("0", "false", "no", "")
 
 
-def get_render(furni):
-    """Descarga el .swf y lo convierte a WebP. Cacheado por (clase, revisión)."""
-    base = furni["classname"].split("*")[0]  # variantes de color comparten swf
-    key = (furni["classname"], furni["revision"])  # cada color es una variante distinta
+def get_render(furnis):
+    """Descarga el .swf y lo convierte a WebP. `furnis` = el mismo furni visto en distintos hoteles.
+    Prueba la revisión de cada hotel hasta que una funcione. Cacheado por (clase, revisiones)."""
+    first = furnis[0]
+    cls = first["classname"]
+    base = cls.split("*")[0]  # variantes de color comparten swf
+    revs = []
+    for f in furnis:
+        if f["revision"] and f["revision"] not in revs:
+            revs.append(f["revision"])
+    key = (cls, tuple(revs))  # cada color es una variante distinta
     if key in _render_cache:
         return _render_cache[key]
     result = None
-    if furni["revision"]:
+    for rev in revs:
         for tpl in SWF_URLS:
-            url = tpl.format(rev=furni["revision"], cls=base)
+            url = tpl.format(rev=rev, cls=base)
             try:
                 r = requests.get(url, headers=HEADERS, timeout=60)
                 if r.status_code == 200 and r.content[:3] in (b"FWS", b"CWS", b"ZWS"):
-                    dd = furni.get("defaultdir")
+                    dd = first.get("defaultdir")
                     data = render_webp(r.content, base, direction=int(dd) if dd and dd.isdigit() else None,
-                                       shadow=furni.get("kind") != "wall",
-                                       color_id=_color_id(furni["classname"]),
-                                       partcolors=furni.get("partcolors"))
+                                       shadow=first.get("kind") != "wall",
+                                       color_id=_color_id(cls),
+                                       partcolors=first.get("partcolors"))
                     result = (data, url)
                     break
             except Exception as e:  # noqa: BLE001
                 print(f"  ! error con {url}: {e}", file=sys.stderr)
+        if result:
+            break
     _render_cache[key] = result
     return result
 
 
-def notify(hotel, flag, furni):
-    render = get_render(furni)
-    fields = [
-        ("ID", furni["id"]), ("Classname", f"`{furni['classname']}`"),
-        ("Revisión", furni["revision"] or "N/D"), ("Furniline", furni["furniline"]),
-        *([("Colores", " ".join(f"`{c}`" for c in furni["partcolors"]))] if furni.get("partcolors") else []),
-        ("Se puede pisar", furni["canstandon"]), ("Se puede sentar", furni["cansiton"]),
-        ("Se puede tumbar", furni["canlayon"]), ("Admite objetos encima", furni["canputstuffon"]),
-        ("Intercambiable", furni["tradeable"]), ("Reciclable", furni["recyclable"]),
-    ]
-    embed = {
-        "title": f"{flag} Nuevo furni: {furni['name']}",
-        "description": (f"Se ha encontrado el nuevo furni **\"{furni['name']}\"** "
-                        f"en el hotel **\"{hotel.upper()}\"**.\n\n> {furni['description']}"),
-        "color": 0x2ECC71,
-        "fields": [{"name": n, "value": str(v), "inline": True} for n, v in fields],
-    }
-    files = None
-    if render:
-        data, url = render
-        embed["image"] = {"url": "attachment://furni.webp"}
-        embed["footer"] = {"text": url}
-        files = {"file": ("furni.webp", data, "image/webp")}
-    payload = {"embeds": [embed]}
-    for attempt in range(5):
+def _post(payload, files=None):
+    for _ in range(5):
         if files:
             r = requests.post(WEBHOOK, data={"payload_json": json.dumps(payload)}, files=files, timeout=60)
         else:
@@ -160,35 +147,122 @@ def notify(hotel, flag, furni):
     time.sleep(1)
 
 
+def _hotel_tags(entries):
+    return ", ".join(f"{flag} {hotel.upper()}" for hotel, flag, _ in entries)
+
+
+def notify_new(entries):
+    """Un único aviso (con imagen) para un furni nuevo. entries = [(hotel, bandera, datos_furni), ...]."""
+    furnis = [f for _, _, f in entries]
+    furni = furnis[0]
+    quoted = ", ".join(f'**"{h.upper()}"**' for h, _, _ in entries)
+    where = f"en el hotel {quoted}" if len(entries) == 1 else f"en los hoteles {quoted}"
+    render = get_render(furnis)
+    fields = [
+        ("Hoteles", _hotel_tags(entries), False),
+        ("ID", furni["id"], True), ("Classname", f"`{furni['classname']}`", True),
+        ("Revisión", furni["revision"] or "N/D", True), ("Furniline", furni["furniline"], True),
+        *([("Colores", " ".join(f"`{c}`" for c in furni["partcolors"]), True)] if furni.get("partcolors") else []),
+        ("Se puede pisar", furni["canstandon"], True), ("Se puede sentar", furni["cansiton"], True),
+        ("Se puede tumbar", furni["canlayon"], True), ("Admite objetos encima", furni["canputstuffon"], True),
+        ("Intercambiable", furni["tradeable"], True), ("Reciclable", furni["recyclable"], True),
+    ]
+    names = {f["name"] for f in furnis}
+    if len(names) > 1:  # el nombre cambia según el idioma del hotel
+        fields.insert(1, ("Nombre por hotel", "\n".join(f"{fl} {h.upper()}: {f['name']}" for h, fl, f in entries), False))
+    embed = {
+        "title": f"🆕 Nuevo furni: {furni['name']}",
+        "description": f"Se ha encontrado el nuevo furni **\"{furni['name']}\"** {where}.\n\n> {furni['description']}",
+        "color": 0x2ECC71,
+        "fields": [{"name": n, "value": str(v), "inline": inl} for n, v, inl in fields],
+    }
+    files = None
+    if render:
+        data, url = render
+        embed["image"] = {"url": "attachment://furni.webp"}
+        embed["footer"] = {"text": url}
+        files = {"file": ("furni.webp", data, "image/webp")}
+    _post({"embeds": [embed]}, files)
+
+
+def notify_followup(entries, seen_in):
+    """Aviso corto (sin imagen): un furni ya anunciado ha llegado a otro hotel."""
+    furni = entries[0][2]
+    before = ", ".join(f"{HOTELS[h][1]} {h.upper()}" for h in seen_in) or "—"
+    embed = {
+        "title": f"🔔 {furni['name']}: ya disponible en otro hotel",
+        "description": (f"El furni **\"{furni['name']}\"** (`{furni['classname']}`) ya se había anunciado "
+                        f"(visto antes en: {before}).\nAhora también aparece en: **{_hotel_tags(entries)}**."),
+        "color": 0x3498DB,
+    }
+    _post({"embeds": [embed]})
+
+
+def notify(hotel, flag, furni):
+    """Compatibilidad (prueba manual): aviso completo de un furni en un solo hotel."""
+    notify_new([(hotel, flag, furni)])
+
+
 def main():
     first_run = not STATE_FILE.exists()
     state = {} if first_run else json.loads(STATE_FILE.read_text())
-    sent = 0
-    for hotel, (url, flag) in HOTELS.items():
+    announced = set(state.pop("_announced", []))
+    if not announced:  # estado antiguo (o primera vez): todo lo ya conocido cuenta como anunciado
+        for lst in state.values():
+            announced |= set(lst)
+
+    # 1) leer los hoteles
+    data = {}
+    for hotel, (url, _) in HOTELS.items():
         try:
-            current = fetch_furnis(url)
+            data[hotel] = fetch_furnis(url)
         except Exception as e:  # noqa: BLE001
             print(f"[{hotel}] ERROR al leer furnidata: {e}", file=sys.stderr)
+
+    # 2) hoteles nuevos: línea base sin avisar
+    baselined = set()
+    for hotel, cur in data.items():
+        if hotel not in state:
+            state[hotel] = sorted(cur)
+            announced |= set(cur)
+            baselined.add(hotel)
+            print(f"[{hotel}] línea base guardada ({len(cur)} furnis)")
+
+    # 3) novedades agrupadas por furni (en el orden en que aparecen)
+    known = {h: set(v) for h, v in state.items()}
+    pending = {}
+    for hotel, cur in data.items():
+        if hotel in baselined:
             continue
-        if hotel not in state:  # línea base: se guarda todo sin avisar
-            state[hotel] = sorted(current)
-            print(f"[{hotel}] línea base guardada ({len(current)} furnis)")
-            continue
-        known = set(state[hotel])
-        new = [c for c in current if c not in known]
-        print(f"[{hotel}] {len(current)} furnis, {len(new)} nuevos")
-        for cls in new:
-            if sent >= MAX_NOTIFY or not WEBHOOK:
-                break  # quedará pendiente para la siguiente ejecución
-            try:
-                notify(hotel, flag, current[cls])
-                known.add(cls)
+        new = [c for c in cur if c not in known[hotel]]
+        print(f"[{hotel}] {len(cur)} furnis, {len(new)} nuevos")
+        for c in new:
+            pending.setdefault(c, []).append(hotel)
+    print(f"{len(pending)} furnis con novedades")
+
+    # 4) avisar (un mensaje por furni, no uno por hotel)
+    sent = 0
+    for cls, hotels in pending.items():
+        if sent >= MAX_NOTIFY or not WEBHOOK:
+            break  # quedará pendiente para la siguiente ejecución
+        entries = [(h, HOTELS[h][1], data[h][cls]) for h in hotels]
+        try:
+            if cls not in announced:
+                notify_new(entries)
+                announced.add(cls)
                 sent += 1
-            except Exception as e:  # noqa: BLE001
-                print(f"[{hotel}] fallo al avisar de {cls}: {e}", file=sys.stderr)
-        state[hotel] = sorted(known)
+            elif FOLLOWUPS:
+                notify_followup(entries, [h for h in known if cls in known[h]])
+                sent += 1
+            for h in hotels:
+                known[h].add(cls)
+        except Exception as e:  # noqa: BLE001
+            print(f"fallo al avisar de {cls}: {e}", file=sys.stderr)
+
+    out = {h: sorted(v) for h, v in known.items()}
+    out["_announced"] = sorted(announced)
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=0, sort_keys=True))
+    STATE_FILE.write_text(json.dumps(out, indent=0, sort_keys=True))
     if first_run:
         print("Primera ejecución: estado inicial guardado sin enviar avisos.")
 
