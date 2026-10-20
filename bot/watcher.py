@@ -45,6 +45,20 @@ def _flag(v):
     return "Sí" if v.strip().lower() in ("1", "true", "yes") else "No"
 
 
+def _partcolors(el):
+    """<partcolors><color>#RRGGBB</color>...</partcolors> -> ['#RRGGBB', ...]"""
+    pc = el.find("partcolors")
+    if pc is None:
+        return []
+    return [(c.text or "").strip() for c in pc.findall("color") if (c.text or "").strip()]
+
+
+def _color_id(classname):
+    """rare_dragonlamp*12 -> 12 (None si no es una variante de color)."""
+    tail = classname.split("*", 1)[1] if "*" in classname else ""
+    return int(tail) if tail.isdigit() else None
+
+
 def fetch_furnis(url):
     r = requests.get(url, headers=HEADERS, timeout=60)
     r.raise_for_status()
@@ -66,6 +80,7 @@ def fetch_furnis(url):
             "classname": cls,
             "revision": _txt(el, "revision"),
             "defaultdir": _txt(el, "defaultdir"),
+            "partcolors": _partcolors(el),
             "name": _txt(el, "name") or cls,
             "description": _txt(el, "description") or "—",
             "canstandon": _flag(_txt(el, "canstandon")),
@@ -85,7 +100,7 @@ _render_cache = {}
 def get_render(furni):
     """Descarga el .swf y lo convierte a WebP. Cacheado por (clase, revisión)."""
     base = furni["classname"].split("*")[0]  # variantes de color comparten swf
-    key = (base, furni["revision"])
+    key = (furni["classname"], furni["revision"])  # cada color es una variante distinta
     if key in _render_cache:
         return _render_cache[key]
     result = None
@@ -97,7 +112,9 @@ def get_render(furni):
                 if r.status_code == 200 and r.content[:3] in (b"FWS", b"CWS", b"ZWS"):
                     dd = furni.get("defaultdir")
                     data = render_webp(r.content, base, direction=int(dd) if dd and dd.isdigit() else None,
-                                       shadow=furni.get("kind") != "wall")
+                                       shadow=furni.get("kind") != "wall",
+                                       color_id=_color_id(furni["classname"]),
+                                       partcolors=furni.get("partcolors"))
                     result = (data, url)
                     break
             except Exception as e:  # noqa: BLE001
@@ -111,6 +128,7 @@ def notify(hotel, flag, furni):
     fields = [
         ("ID", furni["id"]), ("Classname", f"`{furni['classname']}`"),
         ("Revisión", furni["revision"] or "N/D"), ("Furniline", furni["furniline"]),
+        *([("Colores", " ".join(f"`{c}`" for c in furni["partcolors"]))] if furni.get("partcolors") else []),
         ("Se puede pisar", furni["canstandon"]), ("Se puede sentar", furni["cansiton"]),
         ("Se puede tumbar", furni["canlayon"]), ("Admite objetos encima", furni["canputstuffon"]),
         ("Intercambiable", furni["tradeable"]), ("Reciclable", furni["recyclable"]),
