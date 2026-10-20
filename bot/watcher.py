@@ -50,12 +50,19 @@ def fetch_furnis(url):
     r.raise_for_status()
     root = ET.fromstring(r.content)
     out = {}
-    for el in root.iter("furnitype"):
+    pairs = []
+    for tag, kind in (("roomitemtypes", "floor"), ("wallitemtypes", "wall")):
+        for sec in root.iter(tag):
+            pairs += [(el, kind) for el in sec.iter("furnitype")]
+    if not pairs:  # estructura inesperada: leer todo como furni de suelo
+        pairs = [(el, "floor") for el in root.iter("furnitype")]
+    for el, kind in pairs:
         cls = el.get("classname")
         if not cls:
             continue
         out[cls] = {
             "id": el.get("id"),
+            "kind": kind,
             "classname": cls,
             "revision": _txt(el, "revision"),
             "defaultdir": _txt(el, "defaultdir"),
@@ -89,7 +96,8 @@ def get_render(furni):
                 r = requests.get(url, headers=HEADERS, timeout=60)
                 if r.status_code == 200 and r.content[:3] in (b"FWS", b"CWS", b"ZWS"):
                     dd = furni.get("defaultdir")
-                    data = render_webp(r.content, base, direction=int(dd) if dd and dd.isdigit() else None)
+                    data = render_webp(r.content, base, direction=int(dd) if dd and dd.isdigit() else None,
+                                       shadow=furni.get("kind") != "wall")
                     result = (data, url)
                     break
             except Exception as e:  # noqa: BLE001
