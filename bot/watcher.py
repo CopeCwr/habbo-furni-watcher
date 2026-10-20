@@ -28,7 +28,9 @@ SWF_URLS = ["http://images.habbo.com/dcr/hof_furni/{rev}/{cls}.swf",
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state/known.json"))
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 HEADERS = {"User-Agent": "Mozilla/5.0 (FurniWatcher; +github-actions)"}
-MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY", "25"))  # tope de avisos por ejecución
+MAX_NOTIFY = int(os.environ.get("MAX_NOTIFY") or 200)                 # tope de avisos por ejecución
+MAX_RUNTIME = float(os.environ.get("MAX_RUNTIME_MIN") or 80) * 60     # segundos antes de parar con calma
+SAVE_EVERY = 10                                                        # guardar el estado cada N avisos
 
 
 def _txt(el, tag):
@@ -94,7 +96,7 @@ def fetch_furnis(url):
     return out
 
 
-_render_cache = {}
+_render_cache = {}  # (sin uso: no se guardan renders para no gastar memoria)
 FOLLOWUPS = os.environ.get("FOLLOWUPS", "1").strip().lower() not in ("0", "false", "no", "")
 
 
@@ -108,9 +110,6 @@ def get_render(furnis):
     for f in furnis:
         if f["revision"] and f["revision"] not in revs:
             revs.append(f["revision"])
-    key = (cls, tuple(revs))  # cada color es una variante distinta
-    if key in _render_cache:
-        return _render_cache[key]
     result = None
     for rev in revs:
         for tpl in SWF_URLS:
@@ -129,7 +128,6 @@ def get_render(furnis):
                 print(f"  ! error con {url}: {e}", file=sys.stderr)
         if result:
             break
-    _render_cache[key] = result
     return result
 
 
@@ -241,28 +239,43 @@ def main():
     print(f"{len(pending)} furnis con novedades")
 
     # 4) avisar (un mensaje por furni, no uno por hotel)
-    sent = 0
-    for cls, hotels in pending.items():
-        if sent >= MAX_NOTIFY or not WEBHOOK:
-            break  # quedará pendiente para la siguiente ejecución
-        entries = [(h, HOTELS[h][1], data[h][cls]) for h in hotels]
-        try:
-            if cls not in announced:
-                notify_new(entries)
-                announced.add(cls)
-                sent += 1
-            elif FOLLOWUPS:
-                notify_followup(entries, [h for h in known if cls in known[h]])
-                sent += 1
-            for h in hotels:
-                known[h].add(cls)
-        except Exception as e:  # noqa: BLE001
-            print(f"fallo al avisar de {cls}: {e}", file=sys.stderr)
+    def save_state():
+        out = {h: sorted(v) for h, v in known.items()}
+        out["_announced"] = sorted(announced)
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, indent=0, sort_keys=True))
+        tmp.replace(STATE_FILE)  # escritura atómica: nunca queda un archivo a medias
 
-    out = {h: sorted(v) for h, v in known.items()}
-    out["_announced"] = sorted(announced)
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(out, indent=0, sort_keys=True))
+    sent, since_save, started = 0, 0, time.time()
+    try:
+        for cls, hotels in pending.items():
+            if sent >= MAX_NOTIFY or not WEBHOOK:
+                break  # quedará pendiente para la siguiente ejecución
+            if time.time() - started > MAX_RUNTIME:
+                print(f"Tiempo máximo ({MAX_RUNTIME/60:.0f} min) alcanzado: el resto queda para la siguiente ejecución.")
+                break
+            entries = [(h, HOTELS[h][1], data[h][cls]) for h in hotels]
+            try:
+                if cls not in announced:
+                    notify_new(entries)
+                    announced.add(cls)
+                    sent += 1
+                elif FOLLOWUPS:
+                    notify_followup(entries, [h for h in known if cls in known[h]])
+                    sent += 1
+                for h in hotels:
+                    known[h].add(cls)
+                since_save += 1
+                if since_save >= SAVE_EVERY:
+                    save_state()  # si la ejecución se corta, no se repiten los avisos ya enviados
+                    since_save = 0
+            except Exception as e:  # noqa: BLE001
+                print(f"fallo al avisar de {cls}: {e}", file=sys.stderr)
+    finally:
+        save_state()
+    left = sum(1 for c, hs in pending.items() if any(c not in known[h] for h in hs))
+    print(f"{sent} avisos enviados, {left} pendientes para la siguiente ejecución.")
     if first_run:
         print("Primera ejecución: estado inicial guardado sin enviar avisos.")
 
