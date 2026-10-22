@@ -26,7 +26,7 @@ def _xml(blob: bytes) -> ET.Element:
 
 
 def _find_blob(binaries, symbols, suffix):
-    for cid, name in symbols.items():
+    for cid, name in symbols.pairs:
         if name.endswith("_" + suffix) and cid in binaries:
             return binaries[cid]
     return None
@@ -268,7 +268,7 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
                color_id=None, partcolors=None):
     _scaled_cache.clear()
     images, binaries, symbols = parse_swf(swf_bytes)
-    by_name = {sym: images[cid] for cid, sym in symbols.items() if cid in images}
+    by_name = {sym: images[cid] for cid, sym in symbols.pairs if cid in images}
 
     name_re = re.compile(r"^(.*_\d+_[a-z]+)_(\d+)_(\d+)$")
 
@@ -332,15 +332,12 @@ def render_swf(swf_bytes: bytes, classname: str, size: int = 64, direction=None,
         states = {0: {i: None for i in frames_of}}
     state_ids = sorted(states)
 
-    # orden de dibujo: z de la dirección > z de la capa > hereda el anterior
+    # orden de dibujo: z de la dirección > z de la capa > 0; con igual z, por índice de capa
     z_dir = dir_z.get(direction, {})
-    order, prev = [], 0
+    order = []
     for idx in sorted(frames_of):
         z = z_dir.get(idx, layers.get(idx, {}).get("z"))
-        if z is None:
-            z = prev + 1 if (z_dir or any(v.get("z") is not None for v in layers.values())) else 0
-        prev = z
-        order.append((z, idx))
+        order.append((0 if z is None else z, idx))
     order = [i for _, i in sorted(order, key=lambda t: t[0])]
 
     def lens(seqs):
