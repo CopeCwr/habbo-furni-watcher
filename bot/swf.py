@@ -68,12 +68,23 @@ def _lossless(payload: bytes, alpha: bool):
     raise ValueError(f"Formato lossless {fmt} no soportado")
 
 
+class Symbols(dict):
+    """{id: nombre} + .pairs con TODOS los (id, nombre): varios nombres pueden compartir una imagen."""
+    def __init__(self):
+        super().__init__()
+        self.pairs = []
+
+    def add(self, cid, name):
+        self[cid] = name
+        self.pairs.append((cid, name))
+
+
 def parse_swf(data: bytes):
     """Devuelve (images{id: PIL}, binaries{id: bytes}, symbols{id: nombre})."""
     body = _body(data)
     nbits = body[0] >> 3
     pos = (5 + 4 * nbits + 7) // 8 + 4
-    images, binaries, symbols = {}, {}, {}
+    images, binaries, symbols = {}, {}, Symbols()
     while pos + 2 <= len(body):
         (hdr,) = struct.unpack_from("<H", body, pos)
         pos += 2
@@ -98,7 +109,7 @@ def parse_swf(data: bytes):
                 for _ in range(n):
                     (cid,) = struct.unpack_from("<H", payload, p)
                     name, p = _cstr(payload, p + 2)
-                    symbols[cid] = name
+                    symbols.add(cid, name)
         except Exception:
             continue
     return images, binaries, symbols
